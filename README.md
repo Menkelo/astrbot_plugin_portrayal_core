@@ -19,7 +19,7 @@ _✨ 深度群友性格侧写 & 高清画像生成 (Core) ✨_
 
 由于使用了浏览器渲染技术，本插件需要额外的依赖库。
 
-1. **安装两个 Python 库**：
+1. **安装两个 Python 库（可跳过，已写在requirements.txt自动安装）**：
    ```bash
    pip install markdown playwright
    ```
