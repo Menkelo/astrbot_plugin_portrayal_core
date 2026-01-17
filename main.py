@@ -73,7 +73,7 @@ class PortrayalPlugin(Star):
     async def generate_portrayal(self, event: AiocqhttpMessageEvent):
         """指令入口"""
         if not isinstance(event, AiocqhttpMessageEvent):
-            yield event.plain_result("❌ 本插件依赖 OneBot 协议获取历史消息，当前适配器不支持。")
+            yield event.plain_result("本插件依赖 OneBot 协议获取历史消息，当前适配器不支持")
             return
 
         # 1. 准备 LLM Provider
@@ -85,7 +85,7 @@ class PortrayalPlugin(Star):
             else: provider = self.context.get_using_provider()
             
         if not provider:
-            yield event.plain_result("❌ 未找到可用的 LLM 服务。")
+            yield event.plain_result("未找到可用的 LLM 服务")
             return
 
         # 2. 解析参数
@@ -102,18 +102,17 @@ class PortrayalPlugin(Star):
         max_rounds = custom_rounds if custom_rounds else self.config.get("max_query_rounds", 20)
         max_rounds = min(100, max(1, max_rounds))
 
-        # 3. 获取历史消息 (使用缓存或 Fetcher)
+        # 3. 获取历史消息
         texts = []
         completion_text = ""
 
         if not force_refresh and target_id in self.texts_cache:
             texts = self.texts_cache[target_id]
             self.texts_cache.move_to_end(target_id)
-            completion_text = f"✅ 从缓存加载：找到了 {len(texts)} 条有效发言。"
+            completion_text = f"从缓存加载：找到 {len(texts)} 条有效发言"
         else:
-            yield event.plain_result(f"🔍 正在深度回溯 {nickname} 的最近消息 (深度: {max_rounds}轮)...")
+            yield event.plain_result(f"正在回溯 (深度: {max_rounds}轮)...")
             
-            # 使用 Fetcher 模块
             fetcher = MessageFetcher(event.bot)
             batch_size = self.config.get("batch_size", 100)
             texts, rounds_done = await fetcher.fetch_history(
@@ -125,10 +124,10 @@ class PortrayalPlugin(Star):
                 self.texts_cache.move_to_end(target_id)
                 if len(self.texts_cache) > self.MAX_CACHE_SIZE:
                     self.texts_cache.popitem(last=False)
-                completion_text = f"✅ 回溯结束：在 {rounds_done} 轮中找到了 {len(texts)} 条有效发言。"
+                completion_text = f"回溯结束：找到 {len(texts)} 条有效发言"
 
         if not texts or len(texts) < 3:
-            yield event.plain_result(f"⚠️ {nickname} 的发言太少了（仅 {len(texts)} 条），无法生成准确画像。")
+            yield event.plain_result(f"发言太少（仅 {len(texts)} 条），无法生成准确画像")
             return
 
         # 4. 调用 LLM 生成画像
@@ -137,42 +136,75 @@ class PortrayalPlugin(Star):
             nickname=nickname, gender=gender_cn
         )
         
+        # [优化] 将历史消息拼接为纯文本，而不是作为对话上下文列表
+        # 这样可以避免某些模型不支持连续 User 消息的问题，也能降低被安全拦截的概率
+        history_str = "\n".join([f"[{i+1}] {t}" for i, t in enumerate(texts)])
+        
+        final_prompt = (
+            f"以下是目标用户 {nickname} 的最近聊天记录（共 {len(texts)} 条）：\n\n"
+            f"{history_str}\n\n"
+            f"请根据 System Prompt 的要求，对该用户进行深度性格侧写与分析。"
+        )
+        
         try:
-            context_payload = [{"role": "user", "content": t} for t in texts]
-            
             response = await provider.text_chat(
-                prompt=f"以下是 {nickname} 的聊天记录，请根据 System Prompt 要求进行分析：",
+                prompt=final_prompt,
                 system_prompt=system_prompt,
-                contexts=context_payload
+                contexts=[] # 显式传空列表，避免 context 格式问题
             )
             
+            if not response or not response.completion_text:
+                raise ValueError("LLM 返回内容为空")
+
             result_text = response.completion_text
             enable_image = self.config.get("enable_image_output", False)
             sent_success = False
             
-            # 5. 渲染输出
+            # 5. 渲染并发送
             if enable_image:
                 if HAS_RENDER_DEPS:
                     try:
-                        # 使用 Renderer 模块
                         img_bytes = await self.renderer.render(result_text, nickname)
                         
                         chain = []
-                        if completion_text:
-                            chain.append(Plain(completion_text + "\n"))
                         
+                        # [稳健获取消息 ID]
+                        msg_id = None
+                        try:
+                            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
+                                msg_id = event.message_obj.message_id
+                            elif hasattr(event, "raw_data") and isinstance(event.raw_data, dict):
+                                msg_id = event.raw_data.get("message_id")
+                            
+                            if msg_id: msg_id = int(msg_id)
+                        except Exception:
+                            msg_id = None
+                        
+                        # 添加引用回复
+                        if msg_id:
+                            chain.append(Reply(id=msg_id))
+                        
+                        # [保持] 只添加图片，不添加文本
                         chain.append(Image.fromBytes(img_bytes))
+                        
                         yield event.chain_result(chain)
                         sent_success = True
+                        
                     except Exception as e:
-                        logger.error(f"Portrayal: 浏览器渲染失败: {e}")
+                        logger.error(f"Portrayal: 渲染失败: {e}")
                 else:
-                    logger.warning("Portrayal: 开启了图片输出但缺少依赖，请安装 markdown 和 playwright。")
+                    logger.warning("Portrayal: 开启了图片输出但缺少依赖，请安装 markdown 和 playwright")
 
             if not sent_success:
                 final_msg = f"{completion_text}\n\n{result_text}" if completion_text else result_text
                 yield event.plain_result(final_msg)
 
         except Exception as e:
-            logger.error(f"画像生成失败: {e}")
-            yield event.plain_result(f"❌ 分析过程中发生错误: {e}")
+            err_str = str(e)
+            # 针对 Gemini 等模型返回空内容的特定错误进行友好提示
+            if "completion 无法解析" in err_str or "content=None" in err_str:
+                logger.error(f"Portrayal: LLM 返回内容为空，可能是触发了安全过滤。Err: {err_str}")
+                yield event.plain_result("生成失败：LLM 拒绝生成内容（可能是聊天记录包含敏感内容触发了模型的安全过滤，建议更换模型或重试）")
+            else:
+                logger.error(f"画像生成失败: {e}")
+                yield event.plain_result(f"分析过程中发生错误: {e}")
