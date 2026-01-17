@@ -1,6 +1,6 @@
 name: astrbot_plugin_portrayal_core
 display_name: 人物画像(Core)
-desc: 多层分析路由*高清渲染*画像六维分析插件
+desc: 群友性格分析插件（高清渲染版）
 version: v1.2.0
 author: jengaklll-a11y
 repo: https://github.com/jengaklll-a11y/astrbot_plugin_portrayal_core
