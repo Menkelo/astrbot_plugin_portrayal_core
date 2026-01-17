@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from collections import OrderedDict
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
@@ -136,10 +137,7 @@ class PortrayalPlugin(Star):
             nickname=nickname, gender=gender_cn
         )
         
-        # [优化] 将历史消息拼接为纯文本，而不是作为对话上下文列表
-        # 这样可以避免某些模型不支持连续 User 消息的问题，也能降低被安全拦截的概率
         history_str = "\n".join([f"[{i+1}] {t}" for i, t in enumerate(texts)])
-        
         final_prompt = (
             f"以下是目标用户 {nickname} 的最近聊天记录（共 {len(texts)} 条）：\n\n"
             f"{history_str}\n\n"
@@ -150,7 +148,7 @@ class PortrayalPlugin(Star):
             response = await provider.text_chat(
                 prompt=final_prompt,
                 system_prompt=system_prompt,
-                contexts=[] # 显式传空列表，避免 context 格式问题
+                contexts=[]
             )
             
             if not response or not response.completion_text:
@@ -166,32 +164,58 @@ class PortrayalPlugin(Star):
                     try:
                         img_bytes = await self.renderer.render(result_text, nickname)
                         
-                        chain = []
-                        
                         # [稳健获取消息 ID]
                         msg_id = None
                         try:
-                            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
-                                msg_id = event.message_obj.message_id
-                            elif hasattr(event, "raw_data") and isinstance(event.raw_data, dict):
+                            # 优先尝试 raw_data (最底层数据，最准确)
+                            if hasattr(event, "raw_data") and isinstance(event.raw_data, dict):
                                 msg_id = event.raw_data.get("message_id")
                             
+                            # 备选尝试 message_obj
+                            if not msg_id and hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
+                                msg_id = event.message_obj.message_id
+                            
                             if msg_id: msg_id = int(msg_id)
-                        except Exception:
+                        except Exception as e:
+                            logger.warning(f"Portrayal: 获取消息ID异常: {e}")
                             msg_id = None
                         
-                        # 添加引用回复
+                        # [直接构建底层 API 数据包]
+                        b64_img = base64.b64encode(img_bytes).decode()
+                        payload_msg = []
+                        
+                        # 1. 引用回复
                         if msg_id:
-                            chain.append(Reply(id=msg_id))
+                            payload_msg.append({
+                                "type": "reply",
+                                "data": {"id": str(msg_id)}
+                            })
                         
-                        # [保持] 只添加图片，不添加文本
-                        chain.append(Image.fromBytes(img_bytes))
+                        # 2. 图片 (无任何文本节点)
+                        payload_msg.append({
+                            "type": "image",
+                            "data": {"file": f"base64://{b64_img}"}
+                        })
                         
-                        yield event.chain_result(chain)
+                        # [调用 API 发送]
+                        group_id = event.get_group_id()
+                        if group_id:
+                            await event.bot.api.call_action(
+                                "send_group_msg",
+                                group_id=int(group_id),
+                                message=payload_msg
+                            )
+                        else:
+                            await event.bot.api.call_action(
+                                "send_private_msg",
+                                user_id=int(event.get_sender_id()),
+                                message=payload_msg
+                            )
+                            
                         sent_success = True
                         
                     except Exception as e:
-                        logger.error(f"Portrayal: 渲染失败: {e}")
+                        logger.error(f"Portrayal: 渲染或发送失败: {e}")
                 else:
                     logger.warning("Portrayal: 开启了图片输出但缺少依赖，请安装 markdown 和 playwright")
 
@@ -201,10 +225,9 @@ class PortrayalPlugin(Star):
 
         except Exception as e:
             err_str = str(e)
-            # 针对 Gemini 等模型返回空内容的特定错误进行友好提示
             if "completion 无法解析" in err_str or "content=None" in err_str:
-                logger.error(f"Portrayal: LLM 返回内容为空，可能是触发了安全过滤。Err: {err_str}")
-                yield event.plain_result("生成失败：LLM 拒绝生成内容（可能是聊天记录包含敏感内容触发了模型的安全过滤，建议更换模型或重试）")
+                logger.error(f"Portrayal: LLM 拒绝生成。Err: {err_str}")
+                yield event.plain_result("生成失败：LLM 拒绝生成内容（可能是聊天记录包含敏感内容触发了模型的安全过滤）。")
             else:
                 logger.error(f"画像生成失败: {e}")
                 yield event.plain_result(f"分析过程中发生错误: {e}")
