@@ -1,233 +1,207 @@
 import asyncio
 import base64
+import unicodedata
+import re
 from collections import OrderedDict
+
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.api import logger
-from astrbot.api.message_components import At, Reply, Image, Plain
+from astrbot.api.message_components import At
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
-# 导入分层模块
-from .renderer import ProfileRenderer, HAS_RENDER_DEPS
+from .renderer import ProfileRenderer
 from .fetcher import MessageFetcher
+from .llm_client import LLMClient
+
+
+class _ConfigAdapter:
+    """适配 LLMClient 所需配置接口"""
+    def __init__(self, config: AstrBotConfig):
+        self.config = config
+
+    def get_llm_provider_id(self):
+        return self.config.get("llm_provider_id")
+
+    # 兼容 get_xxx_provider_id 的调用
+    def __getattr__(self, name):
+        if name.startswith("get_") and name.endswith("_provider_id"):
+            return lambda: None
+        raise AttributeError(name)
+
 
 class PortrayalPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.texts_cache: OrderedDict[str, list[str]] = OrderedDict()
-        self.MAX_CACHE_SIZE = 50 
+        self.texts_cache = OrderedDict()
+        self.MAX_CACHE_SIZE = 50
         self.renderer = ProfileRenderer()
+        self.config_adapter = _ConfigAdapter(config)
 
-    # ================= 辅助方法 =================
-
-    def _get_target_info(self, event: AiocqhttpMessageEvent):
-        """解析目标用户ID"""
-        for seg in event.get_messages():
-            if isinstance(seg, At) and str(seg.qq) != event.get_self_id():
-                return str(seg.qq)
-        return event.get_sender_id()
-
-    async def _get_user_nickname_gender(self, event: AiocqhttpMessageEvent, user_id: str):
-        """获取昵称和性别"""
-        try:
-            info = await event.bot.get_group_member_info(
-                group_id=int(event.get_group_id()), user_id=int(user_id)
-            )
-            return info.get("card") or info.get("nickname") or "群友", info.get("sex", "unknown")
-        except Exception:
-            return "群友", "unknown"
-
-    def _force_find_provider(self, target_id: str):
-        """查找指定ID的Provider"""
-        if not target_id: return None
-        target_id_lower = target_id.lower()
-        all_providers = []
-        if hasattr(self.context, "register"):
-            reg_providers = getattr(self.context.register, "providers", None)
-            if isinstance(reg_providers, dict): all_providers.extend(reg_providers.values())
-            elif isinstance(reg_providers, list): all_providers.extend(reg_providers)
-        if hasattr(self.context, "get_all_providers"):
-            try: all_providers.extend(self.context.get_all_providers())
-            except Exception: pass
-
-        seen = set()
-        for p in all_providers:
-            if not p or id(p) in seen: continue
-            seen.add(id(p))
-            p_ids = []
-            if hasattr(p, "id") and p.id: p_ids.append(str(p.id))
-            if hasattr(p, "provider_id") and p.provider_id: p_ids.append(str(p.provider_id))
-            if hasattr(p, "config") and isinstance(p.config, dict) and p.config.get("id"): 
-                p_ids.append(str(p.config["id"]))
-            if hasattr(p, "provider_config") and isinstance(p.provider_config, dict) and p.provider_config.get("id"): 
-                p_ids.append(str(p.provider_config["id"]))
-
-            for pid in p_ids:
-                if pid.lower() == target_id_lower: return p
-        return None
-
-    # ================= 主指令逻辑 =================
+    def _is_valid_nickname(self, name: str) -> bool:
+        if not name: return False
+        if not name.strip(): return False
+        for char in name:
+            if char in ('\u3164', '\u2800', '\u115f', '\u1160', '\uffa0'):
+                continue
+            cat = unicodedata.category(char)
+            if cat.startswith('C') or cat.startswith('Z'):
+                continue
+            return True
+        return False
 
     @filter.command("画像")
     async def generate_portrayal(self, event: AiocqhttpMessageEvent):
-        """指令入口"""
-        if not isinstance(event, AiocqhttpMessageEvent):
-            yield event.plain_result("本插件依赖 OneBot 协议获取历史消息，当前适配器不支持")
-            return
+        if not isinstance(event, AiocqhttpMessageEvent): return
 
-        # 1. 准备 LLM Provider
-        provider = None
-        cfg_provider_id = self.config.get("llm_provider_id")
-        if cfg_provider_id: provider = self._force_find_provider(cfg_provider_id)
-        if not provider:
-            if hasattr(event, "unified_msg_origin"): provider = self.context.get_using_provider(event.unified_msg_origin)
-            else: provider = self.context.get_using_provider()
-            
-        if not provider:
-            yield event.plain_result("未找到可用的 LLM 服务")
-            return
+        # 1. 获取触发ID
+        trigger_id = None
+        try:
+            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
+                trigger_id = str(event.message_obj.message_id)
+            if not trigger_id and hasattr(event, "raw_data") and isinstance(event.raw_data, dict):
+                trigger_id = str(event.raw_data.get("message_id"))
+        except:
+            pass
 
-        # 2. 解析参数
-        target_id = self._get_target_info(event)
-        nickname, gender = await self._get_user_nickname_gender(event, target_id)
-        
+        group_id = event.get_group_id()
+        sender_id = event.get_sender_id()
+
+        # 2. 确定目标用户
+        target_id = sender_id
+        for seg in event.get_messages():
+            if isinstance(seg, At) and str(seg.qq) != event.get_self_id():
+                target_id = str(seg.qq)
+                break
+
+        # 3. 获取昵称
+        nickname = str(target_id)
+        gender = "unknown"
+        try:
+            info = await event.bot.get_group_member_info(
+                group_id=int(group_id), user_id=int(target_id)
+            )
+            raw_name = info.get("card") or info.get("nickname") or ""
+            if self._is_valid_nickname(raw_name):
+                nickname = raw_name
+            else:
+                nickname = str(target_id)
+            gender = info.get("sex", "unknown")
+        except:
+            pass
+
+        # 4. 抓取逻辑
         args = event.message_str.split()
-        custom_rounds = None
+        duration = self.config.get("max_fetch_duration", 20)
         force_refresh = False
         for arg in args:
-            if arg.isdigit(): custom_rounds = int(arg)
+            if arg.isdigit(): duration = int(arg)
             if "更新" in arg or "刷新" in arg: force_refresh = True
-            
-        max_rounds = custom_rounds if custom_rounds else self.config.get("max_query_rounds", 20)
-        max_rounds = min(100, max(1, max_rounds))
+        duration = min(300, max(5, duration))
 
-        # 3. 获取历史消息
         texts = []
-        completion_text = ""
+        cache_key = f"{group_id}_{target_id}"
 
-        if not force_refresh and target_id in self.texts_cache:
-            texts = self.texts_cache[target_id]
-            self.texts_cache.move_to_end(target_id)
-            completion_text = f"从缓存加载：找到 {len(texts)} 条有效发言"
+        if not force_refresh and cache_key in self.texts_cache:
+            texts = self.texts_cache[cache_key]
+            self.texts_cache.move_to_end(cache_key)
         else:
-            yield event.plain_result(f"正在回溯 (深度: {max_rounds}轮)...")
-            
+            yield event.plain_result(f"⏳ 全速回溯 {nickname} ({duration}s)...")
             fetcher = MessageFetcher(event.bot)
-            batch_size = self.config.get("batch_size", 100)
-            texts, rounds_done = await fetcher.fetch_history(
-                int(event.get_group_id()), target_id, max_rounds, batch_size
-            )
-            
+            texts, _ = await fetcher.fetch_history(int(group_id), str(target_id), duration)
             if texts:
-                self.texts_cache[target_id] = texts
-                self.texts_cache.move_to_end(target_id)
+                self.texts_cache[cache_key] = texts
+                self.texts_cache.move_to_end(cache_key)
                 if len(self.texts_cache) > self.MAX_CACHE_SIZE:
                     self.texts_cache.popitem(last=False)
-                completion_text = f"回溯结束：找到 {len(texts)} 条有效发言"
+            else:
+                yield event.plain_result(f"⚠️ 未找到 {nickname} 的发言。")
+                return
 
-        if not texts or len(texts) < 3:
-            yield event.plain_result(f"发言太少（仅 {len(texts)} 条），无法生成准确画像")
+        if len(texts) < 3:
+            yield event.plain_result(f"⚠️ 发言过少 ({len(texts)}条)。")
             return
 
-        # 4. 调用 LLM 生成画像
+        # 5. 上下文截断
+        history_str = "\n".join(texts)
+        MAX_CHARS = 12000
+        if len(history_str) > MAX_CHARS:
+            history_str = history_str[-MAX_CHARS:]
+            idx = history_str.find('\n')
+            if idx != -1:
+                history_str = history_str[idx+1:]
+
+        # 6. 生成 Prompt
         gender_cn = "他" if gender == "male" else ("她" if gender == "female" else "TA")
-        system_prompt = self.config.get("system_prompt_template", "").format(
+        sys_prompt = self.config.get("system_prompt_template", "你是一位侧写师。").format(
             nickname=nickname, gender=gender_cn
         )
-        
-        history_str = "\n".join([f"[{i+1}] {t}" for i, t in enumerate(texts)])
-        final_prompt = (
-            f"以下是目标用户 {nickname} 的最近聊天记录（共 {len(texts)} 条）：\n\n"
-            f"{history_str}\n\n"
-            f"请根据 System Prompt 的要求，对该用户进行深度性格侧写与分析。"
+        user_prompt = (
+            f"用户【{nickname}】的历史发言 (精选 {len(history_str)} 字符):\n\n"
+            f"--- 记录开始 ---\n{history_str}\n--- 记录结束 ---\n\n请进行画像分析。"
         )
-        
-        try:
-            response = await provider.text_chat(
-                prompt=final_prompt,
-                system_prompt=system_prompt,
-                contexts=[]
-            )
-            
-            if not response or not response.completion_text:
-                raise ValueError("LLM 返回内容为空")
+        final_prompt = f"{sys_prompt}\n\n{user_prompt}"
 
-            result_text = response.completion_text
-            enable_image = self.config.get("enable_image_output", False)
-            sent_success = False
-            
-            # 5. 渲染并发送
-            if enable_image:
-                if HAS_RENDER_DEPS:
-                    try:
-                        img_bytes = await self.renderer.render(result_text, nickname, target_id)
-                        
-                        # [稳健获取消息 ID]
-                        msg_id = None
-                        try:
-                            # 优先尝试 raw_data (最底层数据，最准确)
-                            if hasattr(event, "raw_data") and isinstance(event.raw_data, dict):
-                                msg_id = event.raw_data.get("message_id")
-                            
-                            # 备选尝试 message_obj
-                            if not msg_id and hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
-                                msg_id = event.message_obj.message_id
-                            
-                            if msg_id: msg_id = int(msg_id)
-                        except Exception as e:
-                            logger.warning(f"Portrayal: 获取消息ID异常: {e}")
-                            msg_id = None
-                        
-                        # [直接构建底层 API 数据包]
-                        b64_img = base64.b64encode(img_bytes).decode()
-                        payload_msg = []
-                        
-                        # 1. 引用回复
-                        if msg_id:
-                            payload_msg.append({
-                                "type": "reply",
-                                "data": {"id": str(msg_id)}
-                            })
-                        
-                        # 2. 图片 (无任何文本节点)
-                        payload_msg.append({
-                            "type": "image",
-                            "data": {"file": f"base64://{b64_img}"}
-                        })
-                        
-                        # [调用 API 发送]
-                        group_id = event.get_group_id()
-                        if group_id:
-                            await event.bot.api.call_action(
-                                "send_group_msg",
-                                group_id=int(group_id),
-                                message=payload_msg
-                            )
-                        else:
-                            await event.bot.api.call_action(
-                                "send_private_msg",
-                                user_id=int(event.get_sender_id()),
-                                message=payload_msg
-                            )
-                            
-                        sent_success = True
-                        
-                    except Exception as e:
-                        logger.error(f"Portrayal: 渲染或发送失败: {e}")
-                else:
-                    logger.warning("Portrayal: 开启了图片输出但缺少依赖，请安装 markdown 和 playwright")
+        # 7. 选择 Provider ID
+        provider_id = await LLMClient.get_provider_id_with_fallback(
+            context=self.context,
+            config_manager=self.config_adapter,
+            provider_id_key=None,
+            umo=event.unified_msg_origin
+        )
 
-            if not sent_success:
-                final_msg = f"{completion_text}\n\n{result_text}" if completion_text else result_text
-                yield event.plain_result(final_msg)
+        if not provider_id:
+            yield event.plain_result("❌ 未找到可用的 LLM 服务。")
+            return
 
-        except Exception as e:
-            err_str = str(e)
-            if "completion 无法解析" in err_str or "content=None" in err_str:
-                logger.error(f"Portrayal: LLM 拒绝生成。Err: {err_str}")
-                yield event.plain_result("生成失败：LLM 拒绝生成内容（可能是聊天记录包含敏感内容触发了模型的安全过滤）。")
+        # 8. 调用 LLM (增加重试机制)
+        MAX_RETRY = 3
+        resp = None
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=final_prompt,
+                    max_tokens=1024,
+                    temperature=0.7
+                )
+            except Exception as e:
+                logger.error(f"Portrayal LLM Error (attempt {attempt}/{MAX_RETRY}): {e}")
+                await asyncio.sleep(0.6 * attempt)
+                continue
+
+            if resp and getattr(resp, "completion_text", ""):
+                break
             else:
-                logger.error(f"画像生成失败: {e}")
-                yield event.plain_result(f"分析过程中发生错误: {e}")
+                logger.warning(f"Portrayal LLM empty output (attempt {attempt}/{MAX_RETRY})")
+                await asyncio.sleep(0.6 * attempt)
+
+        if not resp or not getattr(resp, "completion_text", ""):
+            yield event.plain_result("❌ 模型多次未返回有效内容，请稍后再试。")
+            return
+
+        result_text = resp.completion_text
+
+        # 9. 输出
+        if self.config.get("enable_image_output", True):
+            try:
+                img_bytes = await self.renderer.render(result_text, nickname, str(target_id))
+                b64_img = base64.b64encode(img_bytes).decode()
+
+                payload = []
+                if trigger_id:
+                    payload.append({"type": "reply", "data": {"id": str(trigger_id)}})
+                payload.append({"type": "image", "data": {"file": f"base64://{b64_img}"}})
+
+                await event.bot.api.call_action(
+                    "send_group_msg",
+                    group_id=int(group_id),
+                    message=payload
+                )
+            except Exception as e:
+                logger.error(f"Render Error: {e}")
+                yield event.plain_result(result_text)
+        else:
+            yield event.plain_result(result_text)
