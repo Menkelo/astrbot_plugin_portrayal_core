@@ -1,14 +1,21 @@
 import re
 import base64
 import html
+import hashlib
 from datetime import datetime
-import markdown
-from playwright.async_api import async_playwright
 
+# 渲染依赖探测：缺失时插件仍可加载（降级为纯文本输出）
 try:
+    import markdown
     import aiohttp
+    from playwright.async_api import async_playwright
+    HAS_RENDER_DEPS = True
 except ImportError:
-    raise ImportError("缺少依赖: pip install aiohttp")
+    markdown = None
+    aiohttp = None
+    async_playwright = None
+    HAS_RENDER_DEPS = False
+
 
 class ProfileRenderer:
     DEFAULT_AVATAR = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
@@ -17,7 +24,7 @@ class ProfileRenderer:
         """
         [移植版] 强力头像抓取逻辑 (QuoteCore同款 - 最稳策略)
         """
-        if not qq or not qq.isdigit():
+        if not qq or not str(qq).isdigit():
             return self.DEFAULT_AVATAR
 
         # 强制使用 s=100 (高清图接口经常 403，s=100 最稳定)
@@ -36,23 +43,39 @@ class ProfileRenderer:
                             if len(data) > 500:
                                 b64 = base64.b64encode(data).decode()
                                 return f"data:image/jpg;base64,{b64}"
-                except:
+                except Exception:
                     continue
 
         return self.DEFAULT_AVATAR
 
-    async def render(self, markdown_text: str, nickname: str, user_id: str) -> bytes:
+    def _avatar_html(self, avatar_b64: str, nickname: str) -> str:
+        """有真实头像则用图片，否则用昵称首字母的纯色字母头像兜底"""
+        if avatar_b64 and avatar_b64 != self.DEFAULT_AVATAR:
+            return f'<img class="avatar" src="{avatar_b64}">'
+
+        initial = html.escape(nickname.strip()[:1]) if nickname and nickname.strip() else "?"
+        hue = int(hashlib.md5((nickname or "?").encode()).hexdigest(), 16) % 360
+        return (
+            f'<div class="avatar avatar-mono" '
+            f'style="background:hsl({hue},42%,46%)">{initial}</div>'
+        )
+
+    async def render(self, markdown_text: str, nickname: str, user_id: str = None) -> bytes:
         """
         极简杂志风渲染 (森绿 / Forest Green)
+        user_id 可选：提供则抓取 QQ 头像，否则使用昵称首字母头像兜底
         """
-        # 1. 抓取头像
-        avatar_b64 = await self._fetch_avatar_b64(user_id)
+        # 1. 头像
+        avatar_b64 = self.DEFAULT_AVATAR
+        if user_id:
+            avatar_b64 = await self._fetch_avatar_b64(str(user_id))
+        avatar_html = self._avatar_html(avatar_b64, nickname)
 
         # 2. Token 注入：昵称加粗 + 【标签】转药丸
         if nickname and nickname.strip():
-            safe_nick = re.escape(nickname)
+            safe_nick_re = re.escape(nickname)
             markdown_text = re.sub(
-                f"(?i){safe_nick}",
+                f"(?i){safe_nick_re}",
                 f'**{nickname}**',
                 markdown_text
             )
@@ -71,7 +94,7 @@ class ProfileRenderer:
 
         # 4. 页面数据
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        safe_nick = html.escape(nickname)
+        safe_nick = html.escape(nickname) if nickname else "群友"
 
         # 5. CSS 样式 (森绿封面大刊)
         css = """
@@ -128,6 +151,11 @@ class ProfileRenderer:
             box-shadow: 0 12px 30px rgba(0,0,0,0.20);
             border-radius: 50%;
             background: #e6e6e6;
+        }
+        .avatar-mono {
+            display: flex; align-items: center; justify-content: center;
+            color: #ffffff; font-weight: 900;
+            font-size: 76px; font-family: "Inter", "Noto Serif SC", sans-serif;
         }
         .headtext {
             display: flex; flex-direction: column; justify-content: center;
@@ -218,7 +246,7 @@ class ProfileRenderer:
                 </div>
 
                 <div class="head">
-                    <img class="avatar" src="{avatar_b64}">
+                    {avatar_html}
                     <div class="headtext">
                         <div class="cat">心理侧写 / 群友档案</div>
                         <div class="nm">{safe_nick}</div>
@@ -244,7 +272,8 @@ class ProfileRenderer:
                 page = await browser.new_page(device_scale_factor=3.0)
                 await page.set_content(html_content)
                 card = await page.query_selector("#card")
-                if not card: raise Exception("#card not found")
+                if not card:
+                    raise Exception("#card not found")
                 return await card.screenshot(type="png", omit_background=True)
             finally:
                 await browser.close()

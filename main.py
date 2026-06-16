@@ -162,7 +162,7 @@ class PortrayalPlugin(Star):
             if enable_image:
                 if HAS_RENDER_DEPS:
                     try:
-                        img_bytes = await self.renderer.render(result_text, nickname)
+                        img_bytes = await self.renderer.render(result_text, nickname, target_id)
                         
                         # [稳健获取消息 ID]
                         msg_id = None
