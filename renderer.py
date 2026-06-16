@@ -218,10 +218,19 @@ class ProfileRenderer:
             display: inline-block;
             font-family: "Inter", sans-serif;
             background: var(--soft); color: var(--accent);
-            padding: 2px 16px; border-radius: 4px;
-            font-size: 0.82em; font-weight: 600;
-            vertical-align: middle; margin: 0 2px;
+            padding: 2px 16px; border-radius: 6px;
+            font-size: 28px; line-height: 1.5; font-weight: 600;
+            vertical-align: middle; margin: 0 4px;
+            border: none;
         }
+        /* 标签即使被模型放进标题/加粗里，也保持小尺寸、不带下划线 */
+        .content h1 .topic-pill,
+        .content h2 .topic-pill,
+        .content h3 .topic-pill { font-size: 28px; }
+        .content strong .topic-pill { font-weight: 600; }
+        .content strong:has(> .topic-pill) { border-bottom: none; }
+        .content h2:has(> .topic-pill)::before,
+        .content h2 strong:has(> .topic-pill) { border-bottom: none; }
 
         /* === 页脚 === */
         .foot {
