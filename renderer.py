@@ -2,7 +2,6 @@ import re
 import base64
 import html
 import hashlib
-from datetime import datetime
 
 # 渲染依赖探测：缺失时插件仍可加载（降级为纯文本输出）
 try:
@@ -111,7 +110,6 @@ class ProfileRenderer:
         )
 
         # 4. 页面数据
-        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         safe_nick = html.escape(nickname) if nickname else "群友"
 
         # 5. CSS 样式 (森绿封面大刊)
@@ -286,7 +284,7 @@ class ProfileRenderer:
                 </div>
 
                 <div class="foot">
-                    <span class="cr">Menkelo/astrbot_plugin_portrayal_core</span> · 发布于 {time_str}
+                    <span class="cr">Menkelo/astrbot_plugin_portrayal_core</span>
                 </div>
             </div>
         </body>
