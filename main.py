@@ -226,7 +226,10 @@ class PortrayalPlugin(Star):
 
                 payload = []
                 if trigger_id:
-                    payload.append({"type": "reply", "data": {"id": str(trigger_id)}})
+                    # NapCat 内部以整数管理 message_id，reply.id 传整数更稳；
+                    # 传字符串时部分版本类型不匹配会静默丢掉引用段（图照发、引用丢失）。
+                    reply_id = int(trigger_id) if str(trigger_id).isdigit() else trigger_id
+                    payload.append({"type": "reply", "data": {"id": reply_id}})
                 payload.append({"type": "image", "data": {"file": image_file}})
 
                 # 多账号(self_id)路由：与 SDK 适配器一致，避免发到错误的连接
