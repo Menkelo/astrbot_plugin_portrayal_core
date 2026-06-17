@@ -57,30 +57,39 @@ class PortrayalPlugin(Star):
         if not isinstance(event, AiocqhttpMessageEvent): return
 
         # 1. 获取触发消息ID（用于引用回复原指令）
-        #    优先 SDK 规范字段 message_obj.message_id，再回退到原始消息字典，最后 raw_data
+        #    适配器固定执行 abm.message_id = str(event.message_id)，
+        #    故优先取 message_obj.message_id；并过滤 None/0/空 等无效值，
+        #    否则会带着无效 reply.id 发出，被协议端静默丢弃（图能发但不引用）。
+        def _valid_id(v):
+            if v is None:
+                return None
+            s = str(v).strip()
+            if s in ("", "0", "None", "none", "null", "-1"):
+                return None
+            return s
+
         trigger_id = None
         try:
             mo = getattr(event, "message_obj", None)
-            mid = getattr(mo, "message_id", None) if mo is not None else None
-            if mid is not None and str(mid) != "":
-                trigger_id = str(mid)
+            trigger_id = _valid_id(getattr(mo, "message_id", None)) if mo is not None else None
             if not trigger_id and mo is not None:
                 raw = getattr(mo, "raw_message", None)
-                if isinstance(raw, dict):
-                    mid = raw.get("message_id")
-                    if mid is not None and str(mid) != "":
-                        trigger_id = str(mid)
+                # raw_message 是 aiocqhttp Event（类 dict），用 .get 兜底
+                if raw is not None:
+                    try:
+                        trigger_id = _valid_id(raw.get("message_id"))
+                    except Exception:
+                        trigger_id = _valid_id(getattr(raw, "message_id", None))
             if not trigger_id:
                 raw = getattr(event, "raw_data", None)
                 if isinstance(raw, dict):
-                    mid = raw.get("message_id")
-                    if mid is not None and str(mid) != "":
-                        trigger_id = str(mid)
+                    trigger_id = _valid_id(raw.get("message_id"))
         except Exception as e:
             logger.warning(f"Portrayal: 获取触发消息ID异常: {e}")
 
+        logger.info(f"Portrayal: trigger_id={trigger_id!r}")
         if not trigger_id:
-            logger.warning("Portrayal: 未获取到触发消息ID，本次将不带引用发送")
+            logger.warning("Portrayal: 未获取到有效触发消息ID，本次将不带引用发送")
 
         group_id = event.get_group_id()
         sender_id = event.get_sender_id()
@@ -218,14 +227,26 @@ class PortrayalPlugin(Star):
                     payload.append({"type": "reply", "data": {"id": str(trigger_id)}})
                 payload.append({"type": "image", "data": {"file": f"base64://{b64_img}"}})
 
+                # 多账号(self_id)路由：与 SDK 适配器一致，避免发到错误的连接
+                routing = {}
+                self_id = getattr(getattr(event, "message_obj", None), "self_id", None)
+                if self_id:
+                    routing["self_id"] = self_id
+
+                logger.info(
+                    f"Portrayal: send img with_reply={bool(trigger_id)} "
+                    f"trigger_id={trigger_id!r} group={group_id} self_id={self_id!r}"
+                )
+
                 if group_id:
-                    await event.bot.api.call_action(
-                        "send_group_msg", group_id=int(group_id), message=payload
+                    ret = await event.bot.api.call_action(
+                        "send_group_msg", group_id=int(group_id), message=payload, **routing
                     )
                 else:
-                    await event.bot.api.call_action(
-                        "send_private_msg", user_id=int(sender_id), message=payload
+                    ret = await event.bot.api.call_action(
+                        "send_private_msg", user_id=int(sender_id), message=payload, **routing
                     )
+                logger.info(f"Portrayal: send result={ret}")
             except Exception as e:
                 logger.error(f"Render Error: {e}")
                 yield event.plain_result(result_text)
