@@ -60,7 +60,10 @@ class ProfileRenderer:
         )
 
     def _normalize_md(self, text: str) -> str:
-        """规整模型输出：去掉标题行(## 等)的行首缩进，避免被当成段落/代码块导致 ## 字面显示"""
+        """规整模型输出：
+        1) 去掉标题行行首缩进(否则被当成段落/代码块，## 会字面显示)
+        2) 将任意级别标题统一为 ## (本插件分节统一用二级标题，保证自动编号生效)
+        """
         out, in_fence = [], False
         for line in text.split("\n"):
             if line.lstrip().startswith("```"):
@@ -68,9 +71,9 @@ class ProfileRenderer:
                 out.append(line)
                 continue
             if not in_fence:
-                m = re.match(r"^[ \t]+(#{1,6}\s.*)$", line)
+                m = re.match(r"^[ \t]*#{1,6}(\s.*)$", line)
                 if m:
-                    line = m.group(1)
+                    line = "##" + m.group(1)
             out.append(line)
         return "\n".join(out)
 
