@@ -56,52 +56,17 @@ class PortrayalPlugin(Star):
     async def generate_portrayal(self, event: AiocqhttpMessageEvent):
         if not isinstance(event, AiocqhttpMessageEvent): return
 
-        # 1. 获取触发消息ID（用于引用回复原指令）
-        #    适配器固定执行 abm.message_id = str(event.message_id)，
-        #    故优先取 message_obj.message_id；并过滤 None/0/空 等无效值，
-        #    否则会带着无效 reply.id 发出，被协议端静默丢弃（图能发但不引用）。
-        def _valid_id(v):
-            if v is None:
-                return None
-            s = str(v).strip()
-            if s in ("", "0", "None", "none", "null", "-1"):
-                return None
-            return s
-
-        trigger_id = None
-        try:
-            mo = getattr(event, "message_obj", None)
-            trigger_id = _valid_id(getattr(mo, "message_id", None)) if mo is not None else None
-            if not trigger_id and mo is not None:
-                raw = getattr(mo, "raw_message", None)
-                # raw_message 是 aiocqhttp Event（类 dict），用 .get 兜底
-                if raw is not None:
-                    try:
-                        trigger_id = _valid_id(raw.get("message_id"))
-                    except Exception:
-                        trigger_id = _valid_id(getattr(raw, "message_id", None))
-            if not trigger_id:
-                raw = getattr(event, "raw_data", None)
-                if isinstance(raw, dict):
-                    trigger_id = _valid_id(raw.get("message_id"))
-        except Exception as e:
-            logger.warning(f"Portrayal: 获取触发消息ID异常: {e}")
-
-        logger.info(f"Portrayal: trigger_id={trigger_id!r}")
-        if not trigger_id:
-            logger.warning("Portrayal: 未获取到有效触发消息ID，本次将不带引用发送")
-
         group_id = event.get_group_id()
         sender_id = event.get_sender_id()
 
-        # 2. 确定目标用户
+        # 1. 确定目标用户
         target_id = sender_id
         for seg in event.get_messages():
             if isinstance(seg, At) and str(seg.qq) != event.get_self_id():
                 target_id = str(seg.qq)
                 break
 
-        # 3. 获取昵称
+        # 2. 获取昵称
         nickname = str(target_id)
         gender = "unknown"
         try:
@@ -117,7 +82,7 @@ class PortrayalPlugin(Star):
         except:
             pass
 
-        # 4. 抓取逻辑
+        # 3. 抓取逻辑
         args = event.message_str.split()
         duration = self.config.get("max_fetch_duration", 20)
         force_refresh = False
@@ -149,7 +114,7 @@ class PortrayalPlugin(Star):
             yield event.plain_result(f"⚠️ 发言过少 ({len(texts)}条)。")
             return
 
-        # 5. 上下文截断
+        # 4. 上下文截断
         history_str = "\n".join(texts)
         MAX_CHARS = 12000
         if len(history_str) > MAX_CHARS:
@@ -158,7 +123,7 @@ class PortrayalPlugin(Star):
             if idx != -1:
                 history_str = history_str[idx+1:]
 
-        # 6. 生成 Prompt
+        # 5. 生成 Prompt
         gender_cn = "他" if gender == "male" else ("她" if gender == "female" else "TA")
         default_sys_prompt = (
             "你是一位侧写师，请仅凭群聊记录为群友【{nickname}】做一份性格侧写，用「{gender}」指代本人。\n"
@@ -176,7 +141,7 @@ class PortrayalPlugin(Star):
         )
         final_prompt = f"{sys_prompt}\n\n{user_prompt}"
 
-        # 7. 选择 Provider ID
+        # 6. 选择 Provider ID
         provider_id = await LLMClient.get_provider_id_with_fallback(
             context=self.context,
             config_manager=self.config_adapter,
@@ -188,7 +153,7 @@ class PortrayalPlugin(Star):
             yield event.plain_result("❌ 未找到可用的 LLM 服务。")
             return
 
-        # 8. 调用 LLM (增加重试机制)
+        # 7. 调用 LLM (增加重试机制)
         MAX_RETRY = 3
         resp = None
         for attempt in range(1, MAX_RETRY + 1):
@@ -216,21 +181,24 @@ class PortrayalPlugin(Star):
 
         result_text = resp.completion_text
 
-        # 9. 输出
+        # 8. 输出：以「合并转发」形式发送，转发节点的发送者显示为被侧写人
         if self.config.get("enable_image_output", True):
             try:
                 img_bytes = await self.renderer.render(result_text, nickname, str(target_id))
                 # 跨容器部署（AstrBot 与 NapCat 各自独立 Docker，/tmp 不互通），
-                # file:// 路径会在 NapCat 侧 ENOENT，故统一用 base64 内联图片。
+                # file:// 会在 NapCat 侧 ENOENT，故统一用 base64 内联图片。
                 image_file = "base64://" + base64.b64encode(img_bytes).decode()
 
-                payload = []
-                if trigger_id:
-                    # NapCat 内部以整数管理 message_id，reply.id 传整数更稳；
-                    # 传字符串时部分版本类型不匹配会静默丢掉引用段（图照发、引用丢失）。
-                    reply_id = int(trigger_id) if str(trigger_id).isdigit() else trigger_id
-                    payload.append({"type": "reply", "data": {"id": reply_id}})
-                payload.append({"type": "image", "data": {"file": image_file}})
+                # 伪造转发节点：user_id 决定头像、nickname 决定显示名，
+                # 都填被侧写人，使转发卡片的“发送者”显示为 TA 本人。
+                node = {
+                    "type": "node",
+                    "data": {
+                        "user_id": str(target_id),
+                        "nickname": nickname,
+                        "content": [{"type": "image", "data": {"file": image_file}}],
+                    },
+                }
 
                 # 多账号(self_id)路由：与 SDK 适配器一致，避免发到错误的连接
                 routing = {}
@@ -239,17 +207,19 @@ class PortrayalPlugin(Star):
                     routing["self_id"] = self_id
 
                 logger.info(
-                    f"Portrayal: send img with_reply={bool(trigger_id)} "
-                    f"trigger_id={trigger_id!r} group={group_id} self_id={self_id!r}"
+                    f"Portrayal: send forward target={target_id} nick={nickname!r} "
+                    f"group={group_id} self_id={self_id!r}"
                 )
 
                 if group_id:
                     ret = await event.bot.api.call_action(
-                        "send_group_msg", group_id=int(group_id), message=payload, **routing
+                        "send_group_forward_msg",
+                        group_id=int(group_id), messages=[node], **routing
                     )
                 else:
                     ret = await event.bot.api.call_action(
-                        "send_private_msg", user_id=int(sender_id), message=payload, **routing
+                        "send_private_forward_msg",
+                        user_id=int(sender_id), messages=[node], **routing
                     )
                 logger.info(f"Portrayal: send result={ret}")
             except Exception as e:
