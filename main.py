@@ -1,8 +1,12 @@
 import asyncio
 import base64
-import unicodedata
+import os
 import re
+import tempfile
+import unicodedata
+import uuid
 from collections import OrderedDict
+from pathlib import Path
 
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
@@ -218,37 +222,32 @@ class PortrayalPlugin(Star):
 
         # 9. 输出
         if self.config.get("enable_image_output", True):
+            tmp_path = None
             try:
                 img_bytes = await self.renderer.render(result_text, nickname, str(target_id))
-                b64_img = base64.b64encode(img_bytes).decode()
+
+                # 图片源：AstrBot 与 NapCat 同机时优先用本地文件路径(file://)。
+                # NapCat 对“引用段 + base64 大图”的关联存在偶发丢失（图能发但不引用），
+                # 改用文件路径后引用稳定。写文件失败时回退 base64。
+                image_file = None
+                try:
+                    tmp_path = os.path.join(
+                        tempfile.gettempdir(), f"portrayal_{uuid.uuid4().hex}.png"
+                    )
+                    with open(tmp_path, "wb") as f:
+                        f.write(img_bytes)
+                    image_file = Path(tmp_path).as_uri()  # file:///...
+                except Exception as e:
+                    logger.warning(f"Portrayal: 写临时图片失败，回退 base64: {e}")
+                    tmp_path = None
+                    image_file = "base64://" + base64.b64encode(img_bytes).decode()
 
                 payload = []
                 if trigger_id:
                     payload.append({"type": "reply", "data": {"id": str(trigger_id)}})
-                payload.append({"type": "image", "data": {"file": f"base64://{b64_img}"}})
+                payload.append({"type": "image", "data": {"file": image_file}})
 
                 # 多账号(self_id)路由：与 SDK 适配器一致，避免发到错误的连接
                 routing = {}
                 self_id = getattr(getattr(event, "message_obj", None), "self_id", None)
-                if self_id:
-                    routing["self_id"] = self_id
-
-                logger.info(
-                    f"Portrayal: send img with_reply={bool(trigger_id)} "
-                    f"trigger_id={trigger_id!r} group={group_id} self_id={self_id!r}"
-                )
-
-                if group_id:
-                    ret = await event.bot.api.call_action(
-                        "send_group_msg", group_id=int(group_id), message=payload, **routing
-                    )
-                else:
-                    ret = await event.bot.api.call_action(
-                        "send_private_msg", user_id=int(sender_id), message=payload, **routing
-                    )
-                logger.info(f"Portrayal: send result={ret}")
-            except Exception as e:
-                logger.error(f"Render Error: {e}")
-                yield event.plain_result(result_text)
-        else:
-            yield event.plain_result(result_text)
+      
