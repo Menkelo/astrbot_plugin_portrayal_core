@@ -1,12 +1,8 @@
 import asyncio
 import base64
-import os
 import re
-import tempfile
 import unicodedata
-import uuid
 from collections import OrderedDict
-from pathlib import Path
 
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
@@ -222,25 +218,11 @@ class PortrayalPlugin(Star):
 
         # 9. 输出
         if self.config.get("enable_image_output", True):
-            tmp_path = None
             try:
                 img_bytes = await self.renderer.render(result_text, nickname, str(target_id))
-
-                # 图片源：AstrBot 与 NapCat 同机时优先用本地文件路径(file://)。
-                # NapCat 对“引用段 + base64 大图”的关联存在偶发丢失（图能发但不引用），
-                # 改用文件路径后引用稳定。写文件失败时回退 base64。
-                image_file = None
-                try:
-                    tmp_path = os.path.join(
-                        tempfile.gettempdir(), f"portrayal_{uuid.uuid4().hex}.png"
-                    )
-                    with open(tmp_path, "wb") as f:
-                        f.write(img_bytes)
-                    image_file = Path(tmp_path).as_uri()  # file:///...
-                except Exception as e:
-                    logger.warning(f"Portrayal: 写临时图片失败，回退 base64: {e}")
-                    tmp_path = None
-                    image_file = "base64://" + base64.b64encode(img_bytes).decode()
+                # 跨容器部署（AstrBot 与 NapCat 各自独立 Docker，/tmp 不互通），
+                # file:// 路径会在 NapCat 侧 ENOENT，故统一用 base64 内联图片。
+                image_file = "base64://" + base64.b64encode(img_bytes).decode()
 
                 payload = []
                 if trigger_id:
@@ -255,8 +237,7 @@ class PortrayalPlugin(Star):
 
                 logger.info(
                     f"Portrayal: send img with_reply={bool(trigger_id)} "
-                    f"trigger_id={trigger_id!r} group={group_id} self_id={self_id!r} "
-                    f"img_src={'file' if tmp_path else 'base64'}"
+                    f"trigger_id={trigger_id!r} group={group_id} self_id={self_id!r}"
                 )
 
                 if group_id:
@@ -271,12 +252,5 @@ class PortrayalPlugin(Star):
             except Exception as e:
                 logger.error(f"Render Error: {e}")
                 yield event.plain_result(result_text)
-            finally:
-                # call_action 返回时 NapCat 已读取图片，可安全清理临时文件
-                if tmp_path:
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
         else:
             yield event.plain_result(result_text)
