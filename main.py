@@ -196,7 +196,10 @@ class PortrayalPlugin(Star):
                     "data": {
                         "user_id": str(target_id),
                         "nickname": nickname,
-                        "content": [{"type": "image", "data": {"file": image_file}}],
+                        "content": [
+                            {"type": "text", "data": {"text": "画像分析完毕↓"}},
+                            {"type": "image", "data": {"file": image_file}},
+                        ],
                     },
                 }
 
