@@ -60,6 +60,21 @@ class ProfileRenderer:
             f'style="background:hsl({hue},42%,46%)">{initial}</div>'
         )
 
+    def _normalize_md(self, text: str) -> str:
+        """规整模型输出：去掉标题行(## 等)的行首缩进，避免被当成段落/代码块导致 ## 字面显示"""
+        out, in_fence = [], False
+        for line in text.split("\n"):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+                out.append(line)
+                continue
+            if not in_fence:
+                m = re.match(r"^[ \t]+(#{1,6}\s.*)$", line)
+                if m:
+                    line = m.group(1)
+            out.append(line)
+        return "\n".join(out)
+
     async def render(self, markdown_text: str, nickname: str, user_id: str = None) -> bytes:
         """
         极简杂志风渲染 (森绿 / Forest Green)
@@ -70,6 +85,9 @@ class ProfileRenderer:
         if user_id:
             avatar_b64 = await self._fetch_avatar_b64(str(user_id))
         avatar_html = self._avatar_html(avatar_b64, nickname)
+
+        # 1.5 规整 Markdown（去标题缩进）
+        markdown_text = self._normalize_md(markdown_text)
 
         # 2. Token 注入：昵称加粗 + 【标签】转药丸
         if nickname and nickname.strip():
