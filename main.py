@@ -189,19 +189,23 @@ class PortrayalPlugin(Star):
                 # file:// 会在 NapCat 侧 ENOENT，故统一用 base64 内联图片。
                 image_file = "base64://" + base64.b64encode(img_bytes).decode()
 
-                # 文字提示与转发卡片拆成两条独立消息：先发文字
-                yield event.plain_result("画像分析完毕↓")
-
                 # 伪造转发节点：user_id 决定头像、nickname 决定显示名，
                 # 都填被侧写人，使转发卡片的“发送者”显示为 TA 本人。
-                node = {
-                    "type": "node",
-                    "data": {
-                        "user_id": str(target_id),
-                        "nickname": nickname,
-                        "content": [{"type": "image", "data": {"file": image_file}}],
-                    },
-                }
+                def _node(content):
+                    return {
+                        "type": "node",
+                        "data": {
+                            "user_id": str(target_id),
+                            "nickname": nickname,
+                            "content": content,
+                        },
+                    }
+
+                # 文字与图片各作为卡片内的一条独立消息（两个节点）
+                messages = [
+                    _node([{"type": "text", "data": {"text": "画像分析完毕↓"}}]),
+                    _node([{"type": "image", "data": {"file": image_file}}]),
+                ]
 
                 # 多账号(self_id)路由：与 SDK 适配器一致，避免发到错误的连接
                 routing = {}
@@ -217,12 +221,12 @@ class PortrayalPlugin(Star):
                 if group_id:
                     ret = await event.bot.api.call_action(
                         "send_group_forward_msg",
-                        group_id=int(group_id), messages=[node], **routing
+                        group_id=int(group_id), messages=messages, **routing
                     )
                 else:
                     ret = await event.bot.api.call_action(
                         "send_private_forward_msg",
-                        user_id=int(sender_id), messages=[node], **routing
+                        user_id=int(sender_id), messages=messages, **routing
                     )
                 logger.info(f"Portrayal: send result={ret}")
             except Exception as e:
