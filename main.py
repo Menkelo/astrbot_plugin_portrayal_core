@@ -56,21 +56,31 @@ class PortrayalPlugin(Star):
     async def generate_portrayal(self, event: AiocqhttpMessageEvent):
         if not isinstance(event, AiocqhttpMessageEvent): return
 
-        # 1. 获取触发消息ID（用于引用回复原指令），优先最底层 raw_data，严格排除 None/空
+        # 1. 获取触发消息ID（用于引用回复原指令）
+        #    优先 SDK 规范字段 message_obj.message_id，再回退到原始消息字典，最后 raw_data
         trigger_id = None
         try:
-            raw = getattr(event, "raw_data", None)
-            if isinstance(raw, dict):
-                mid = raw.get("message_id")
-                if mid is not None and str(mid) != "":
-                    trigger_id = str(mid)
+            mo = getattr(event, "message_obj", None)
+            mid = getattr(mo, "message_id", None) if mo is not None else None
+            if mid is not None and str(mid) != "":
+                trigger_id = str(mid)
+            if not trigger_id and mo is not None:
+                raw = getattr(mo, "raw_message", None)
+                if isinstance(raw, dict):
+                    mid = raw.get("message_id")
+                    if mid is not None and str(mid) != "":
+                        trigger_id = str(mid)
             if not trigger_id:
-                mo = getattr(event, "message_obj", None)
-                mid = getattr(mo, "message_id", None) if mo is not None else None
-                if mid is not None and str(mid) != "":
-                    trigger_id = str(mid)
-        except Exception:
-            pass
+                raw = getattr(event, "raw_data", None)
+                if isinstance(raw, dict):
+                    mid = raw.get("message_id")
+                    if mid is not None and str(mid) != "":
+                        trigger_id = str(mid)
+        except Exception as e:
+            logger.warning(f"Portrayal: 获取触发消息ID异常: {e}")
+
+        if not trigger_id:
+            logger.warning("Portrayal: 未获取到触发消息ID，本次将不带引用发送")
 
         group_id = event.get_group_id()
         sender_id = event.get_sender_id()
@@ -141,7 +151,14 @@ class PortrayalPlugin(Star):
 
         # 6. 生成 Prompt
         gender_cn = "他" if gender == "male" else ("她" if gender == "female" else "TA")
-        sys_prompt = self.config.get("system_prompt_template", "你是一位侧写师。").format(
+        default_sys_prompt = (
+            "你是一位侧写师，请仅凭群聊记录为群友【{nickname}】做一份性格侧写，用「{gender}」指代本人。\n"
+            "输出格式要求：\n"
+            "- 每个板块标题统一用 `##` 开头，序号会自动生成，标题里不要手动写「一、」「1.」之类的编号。\n"
+            "- 关键标签用「【】」包裹，核心结论用 **加粗**。\n"
+            "- 直接输出报告正文，不要写思考过程、开场白或结束语。"
+        )
+        sys_prompt = self.config.get("system_prompt_template", default_sys_prompt).format(
             nickname=nickname, gender=gender_cn
         )
         user_prompt = (

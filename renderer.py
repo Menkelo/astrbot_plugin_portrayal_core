@@ -62,26 +62,48 @@ class ProfileRenderer:
     def _normalize_md(self, text: str) -> str:
         """规整模型输出的标题，保证自动编号(01/02)稳定生效：
         1) 兼容任意级别(#~######)、可被 ** 加粗包裹、可带行首缩进的标题
-        2) 统一抽取为纯净的二级标题 `## 标题`
-        3) 标题前后自动补空行，使其独立成块(避免紧跟表格/列表时不被解析)
+        2) 兼容“整行纯加粗”当小节标题的写法(无 # 时也能识别)
+        3) 去除标题中自带的人工编号(如 一、/ 1. / （1）)，避免与 CSS 自动编号叠加
+        4) 统一抽取为纯净的二级标题 `## 标题`，前后补空行使其独立成块
         代码围栏 ``` 内的内容原样保留。
         """
+        # 带 # 的标题
         HEAD = re.compile(r"^\s*\*{0,3}\s*#{1,6}\s+(.+?)\s*\**\s*$")
+        # 整行被 ** 包裹、且内部不含其它 ** 的，视为小节标题
+        BOLD_HEAD = re.compile(r"^\s*\*\*([^*]+?)\*\*\s*$")
+        # 标题前的人工编号：1. / 1、/ 1) / （1）/ (1) / 一、/ 01. 等
+        LEAD_NUM = re.compile(
+            r"^\s*[(（]?\s*(?:\d{1,3}|[一二三四五六七八九十]+)\s*[)）.、:：]\s*"
+        )
         out, in_fence = [], False
         for line in text.split("\n"):
             if line.lstrip().startswith("```"):
                 in_fence = not in_fence
                 out.append(line)
                 continue
+
+            title = None
             if not in_fence:
                 m = HEAD.match(line)
                 if m:
-                    title = m.group(1).strip().strip("*").strip().rstrip("#").strip()
-                    if out and out[-1].strip() != "":
-                        out.append("")
-                    out.append("## " + title)
-                    out.append("")
+                    title = m.group(1)
+                else:
+                    mb = BOLD_HEAD.match(line)
+                    if mb:
+                        title = mb.group(1)
+
+            if title is not None:
+                title = title.strip().strip("*").strip().rstrip("#").strip()
+                title = LEAD_NUM.sub("", title).strip()
+                if not title:          # 去编号后为空则按普通行处理
+                    out.append(line)
                     continue
+                if out and out[-1].strip() != "":
+                    out.append("")
+                out.append("## " + title)
+                out.append("")
+                continue
+
             out.append(line)
         return "\n".join(out)
 
