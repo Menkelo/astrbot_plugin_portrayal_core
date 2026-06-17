@@ -189,6 +189,9 @@ class PortrayalPlugin(Star):
                 # file:// 会在 NapCat 侧 ENOENT，故统一用 base64 内联图片。
                 image_file = "base64://" + base64.b64encode(img_bytes).decode()
 
+                # 文字提示与转发卡片拆成两条独立消息：先发文字
+                yield event.plain_result("画像分析完毕↓")
+
                 # 伪造转发节点：user_id 决定头像、nickname 决定显示名，
                 # 都填被侧写人，使转发卡片的“发送者”显示为 TA 本人。
                 node = {
@@ -196,10 +199,7 @@ class PortrayalPlugin(Star):
                     "data": {
                         "user_id": str(target_id),
                         "nickname": nickname,
-                        "content": [
-                            {"type": "text", "data": {"text": "画像分析完毕↓"}},
-                            {"type": "image", "data": {"file": image_file}},
-                        ],
+                        "content": [{"type": "image", "data": {"file": image_file}}],
                     },
                 }
 
