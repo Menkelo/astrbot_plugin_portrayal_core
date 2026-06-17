@@ -250,4 +250,33 @@ class PortrayalPlugin(Star):
                 # 多账号(self_id)路由：与 SDK 适配器一致，避免发到错误的连接
                 routing = {}
                 self_id = getattr(getattr(event, "message_obj", None), "self_id", None)
-      
+                if self_id:
+                    routing["self_id"] = self_id
+
+                logger.info(
+                    f"Portrayal: send img with_reply={bool(trigger_id)} "
+                    f"trigger_id={trigger_id!r} group={group_id} self_id={self_id!r} "
+                    f"img_src={'file' if tmp_path else 'base64'}"
+                )
+
+                if group_id:
+                    ret = await event.bot.api.call_action(
+                        "send_group_msg", group_id=int(group_id), message=payload, **routing
+                    )
+                else:
+                    ret = await event.bot.api.call_action(
+                        "send_private_msg", user_id=int(sender_id), message=payload, **routing
+                    )
+                logger.info(f"Portrayal: send result={ret}")
+            except Exception as e:
+                logger.error(f"Render Error: {e}")
+                yield event.plain_result(result_text)
+            finally:
+                # call_action 返回时 NapCat 已读取图片，可安全清理临时文件
+                if tmp_path:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        else:
+            yield event.plain_result(result_text)
