@@ -56,14 +56,20 @@ class PortrayalPlugin(Star):
     async def generate_portrayal(self, event: AiocqhttpMessageEvent):
         if not isinstance(event, AiocqhttpMessageEvent): return
 
-        # 1. 获取触发ID
+        # 1. 获取触发消息ID（用于引用回复原指令），优先最底层 raw_data，严格排除 None/空
         trigger_id = None
         try:
-            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
-                trigger_id = str(event.message_obj.message_id)
-            if not trigger_id and hasattr(event, "raw_data") and isinstance(event.raw_data, dict):
-                trigger_id = str(event.raw_data.get("message_id"))
-        except:
+            raw = getattr(event, "raw_data", None)
+            if isinstance(raw, dict):
+                mid = raw.get("message_id")
+                if mid is not None and str(mid) != "":
+                    trigger_id = str(mid)
+            if not trigger_id:
+                mo = getattr(event, "message_obj", None)
+                mid = getattr(mo, "message_id", None) if mo is not None else None
+                if mid is not None and str(mid) != "":
+                    trigger_id = str(mid)
+        except Exception:
             pass
 
         group_id = event.get_group_id()
@@ -195,11 +201,14 @@ class PortrayalPlugin(Star):
                     payload.append({"type": "reply", "data": {"id": str(trigger_id)}})
                 payload.append({"type": "image", "data": {"file": f"base64://{b64_img}"}})
 
-                await event.bot.api.call_action(
-                    "send_group_msg",
-                    group_id=int(group_id),
-                    message=payload
-                )
+                if group_id:
+                    await event.bot.api.call_action(
+                        "send_group_msg", group_id=int(group_id), message=payload
+                    )
+                else:
+                    await event.bot.api.call_action(
+                        "send_private_msg", user_id=int(sender_id), message=payload
+                    )
             except Exception as e:
                 logger.error(f"Render Error: {e}")
                 yield event.plain_result(result_text)
